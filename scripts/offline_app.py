@@ -1,5 +1,7 @@
 import os
 ROOT = os.path.dirname(os.path.dirname(__file__))
+if os.name == "nt":
+    os.environ.setdefault("PYOPENGL_PLATFORM", "win32")
 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +19,7 @@ def gen_id():
     return f"{t}_{u}"
 
 import argparse
+import json
 import time
 import cv2
 import glob
@@ -85,7 +88,7 @@ def read_frame_at(path: str, idx: int):
     return Image.fromarray(frame)
 
 
-def build_sam3_3d_body_config(cfg):
+def build_sam3_3d_body_config(cfg, use_human_detector: bool = True):
     mhr_path = cfg.sam_3d_body['mhr_path']
     fov_path = cfg.sam_3d_body['fov_path']
     detector_path = cfg.sam_3d_body['detector_path']
@@ -97,8 +100,9 @@ def build_sam3_3d_body_config(cfg):
     human_detector, human_segmentor, fov_estimator = None, None, None
     from models.sam_3d_body.tools.build_fov_estimator import FOVEstimator
     fov_estimator = FOVEstimator(name='moge2', device=device, path=fov_path)
-    from models.sam_3d_body.tools.build_detector import HumanDetector
-    human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
+    if use_human_detector:
+        from models.sam_3d_body.tools.build_detector import HumanDetector
+        human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
 
     estimator = SAM3DBodyEstimator(
         sam_3d_body_model=model,
@@ -128,13 +132,22 @@ def build_diffusion_vas_config(cfg):
 
 
 class OfflineApp:
-    def __init__(self, config_path: str = os.path.join(ROOT, "configs", "body4d.yaml")):
+    def __init__(
+        self,
+        config_path: str = os.path.join(ROOT, "configs", "body4d.yaml"),
+        use_human_detector: bool = True,
+        enable_completion: bool = True,
+        tracks_only: bool = False,
+    ):
         """Initialize CONFIG, SAM3_MODEL, and global RUNTIME dict."""
         self.CONFIG = OmegaConf.load(config_path)
         self.sam3_model, self.predictor = build_sam3_from_config(self.CONFIG)
-        self.sam3_3d_body_model = build_sam3_3d_body_config(self.CONFIG)
+        self.sam3_3d_body_model = build_sam3_3d_body_config(
+            self.CONFIG,
+            use_human_detector=use_human_detector,
+        )
 
-        if self.CONFIG.completion.get('enable', False):
+        if enable_completion and self.CONFIG.completion.get('enable', False):
             self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = build_diffusion_vas_config(self.CONFIG)
         else:
             self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = None, None, None, None, None
@@ -147,6 +160,73 @@ class OfflineApp:
         self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [512, 1024])
         self.RUNTIME['smpl_export'] = self.CONFIG.runtime.get('smpl_export', False)
         self.RUNTIME['bboxes'] = None
+        self.track_export_dir = None
+        self.track_source_fps = None
+        self.track_records = {}
+        self.tracks_only = tracks_only
+
+    def configure_track_export(self, output_dir: str, source_fps: float) -> None:
+        self.track_export_dir = output_dir
+        self.track_source_fps = source_fps
+        os.makedirs(output_dir, exist_ok=True)
+
+    def append_track_outputs(self, frame_index: int, outputs, object_ids) -> None:
+        if self.track_export_dir is None or outputs is None or object_ids is None:
+            return
+        if len(outputs) != len(object_ids):
+            raise ValueError(
+                f"Track export output/id mismatch at frame {frame_index}: "
+                f"{len(outputs)} outputs, {len(object_ids)} ids"
+            )
+
+        for object_id, output in zip(object_ids, outputs):
+            record = self.track_records.setdefault(
+                int(object_id),
+                {
+                    "frame_index": [],
+                    "keypoints_3d": [],
+                    "camera_translation": [],
+                    "bbox": [],
+                    "focal_length": [],
+                },
+            )
+            record["frame_index"].append(int(frame_index))
+            record["keypoints_3d"].append(output["pred_keypoints_3d"].astype(np.float32))
+            record["camera_translation"].append(output["pred_cam_t"].astype(np.float32))
+            record["bbox"].append(output["bbox"].astype(np.float32))
+            record["focal_length"].append(float(output["focal_length"]))
+
+    def save_track_outputs(self) -> None:
+        if self.track_export_dir is None:
+            return
+
+        manifest = {
+            "format": "sam-body4d-mhr70-track-v1",
+            "source_fps": self.track_source_fps,
+            "tracks": [],
+        }
+        for object_id, record in sorted(self.track_records.items()):
+            output_name = f"track_{object_id:03d}.npz"
+            output_path = os.path.join(self.track_export_dir, output_name)
+            np.savez_compressed(
+                output_path,
+                frame_index=np.asarray(record["frame_index"], dtype=np.int32),
+                keypoints_3d=np.stack(record["keypoints_3d"]).astype(np.float32),
+                camera_translation=np.stack(record["camera_translation"]).astype(np.float32),
+                bbox=np.stack(record["bbox"]).astype(np.float32),
+                focal_length=np.asarray(record["focal_length"], dtype=np.float32),
+            )
+            manifest["tracks"].append(
+                {
+                    "object_id": object_id,
+                    "file": output_name,
+                    "frame_count": len(record["frame_index"]),
+                }
+            )
+
+        manifest_path = os.path.join(self.track_export_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, ensure_ascii=False, indent=2)
 
     def on_mask_generation(self, video_path: str=None, start_frame_idx: int = 0, max_frame_num_to_track: int = 1800):
         """
@@ -452,6 +532,13 @@ class OfflineApp:
                 else:
                     mask_output = mask_outputs[frame_id-num_empth_ids]
                     id_current = id_batch[frame_id-num_empth_ids]
+                self.append_track_outputs(
+                    int(os.path.splitext(os.path.basename(image_path))[0]),
+                    mask_output,
+                    id_current,
+                )
+                if self.tracks_only:
+                    continue
                 img = cv2.imread(image_path)
                 rend_img = visualize_sample_together(img, mask_output, self.sam3_3d_body_model.faces, id_current)
                 cv2.imwrite(
@@ -476,18 +563,36 @@ class OfflineApp:
                     id_current=id_current,
                 )
 
+        self.save_track_outputs()
+        if self.tracks_only:
+            return None
+
         out_4d_path = os.path.join(self.OUTPUT_DIR, f"4d_{time.time():.0f}.mp4")
         jpg_folder_to_mp4(f"{self.OUTPUT_DIR}/rendered_frames", out_4d_path)
-
         return out_4d_path
 
 
 def inference(args):
     # init configs and cover with cmd options
-    predictor = OfflineApp()
+    predictor = OfflineApp(
+        config_path=args.config,
+        use_human_detector=not args.full_frame,
+        enable_completion=not args.disable_completion,
+        tracks_only=args.tracks_only,
+    )
     if args.output_dir is not None:
         predictor.OUTPUT_DIR = args.output_dir
         os.makedirs(predictor.OUTPUT_DIR, exist_ok=True)
+
+    if args.export_tracks_dir is not None:
+        source_fps = args.source_fps
+        if source_fps is None and os.path.isfile(args.input_video):
+            capture = cv2.VideoCapture(args.input_video)
+            source_fps = capture.get(cv2.CAP_PROP_FPS)
+            capture.release()
+        if source_fps is None or source_fps <= 0:
+            raise ValueError("--source_fps is required when input FPS cannot be read")
+        predictor.configure_track_export(args.export_tracks_dir, source_fps)
 
     # human detection on the frame where human FIRST appear
     if os.path.isfile(args.input_video) and args.input_video.endswith(".mp4"):
@@ -558,8 +663,14 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Offline 4D Body Generation from Videos")
+    parser.add_argument("--config", type=str, default=os.path.join(ROOT, "configs", "body4d.yaml"), help="Runtime YAML configuration path")
     parser.add_argument("--output_dir", type=str, help="Path to the output directory")
     parser.add_argument("--input_video", type=str, required=True, help="Path to the input video (either *.mp4 or a directory containing image sequences)")
+    parser.add_argument("--export_tracks_dir", type=str, help="Directory for per-person MHR70 track files")
+    parser.add_argument("--source_fps", type=float, help="Input FPS when --input_video is an image directory")
+    parser.add_argument("--full_frame", action="store_true", help="Use the full frame as the initial person region instead of ViTDet")
+    parser.add_argument("--disable_completion", action="store_true", help="Disable optional Diffusion-VAS completion models")
+    parser.add_argument("--tracks_only", action="store_true", help="Save track data without rendering meshes or exporting PLY files")
     args = parser.parse_args()
 
     input_path = args.input_video
