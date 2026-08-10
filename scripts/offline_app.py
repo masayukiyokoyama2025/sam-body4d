@@ -32,6 +32,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
+from utils.video_stabilization import StabilizationConfig, stabilize_video
 
 from models.sam_3d_body.sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from models.sam_3d_body.notebook.utils import process_image_with_mask, save_mesh_results
@@ -573,6 +574,21 @@ class OfflineApp:
 
 
 def inference(args):
+    input_video = args.input_video
+    if args.stabilize:
+        stabilization_config = StabilizationConfig(
+            smoothing_sec=args.stabilize_smoothing_sec,
+            min_inliers=args.stabilize_min_inliers,
+            min_inlier_ratio=args.stabilize_min_inlier_ratio,
+        )
+        stabilize_video(
+            input_path=input_video,
+            output_path=args.stabilize_output,
+            diagnostics_path=args.stabilize_diagnostics,
+            config=stabilization_config,
+        )
+        input_video = args.stabilize_output
+
     # init configs and cover with cmd options
     predictor = OfflineApp(
         config_path=args.config,
@@ -586,8 +602,8 @@ def inference(args):
 
     if args.export_tracks_dir is not None:
         source_fps = args.source_fps
-        if source_fps is None and os.path.isfile(args.input_video):
-            capture = cv2.VideoCapture(args.input_video)
+        if source_fps is None and os.path.isfile(input_video):
+            capture = cv2.VideoCapture(input_video)
             source_fps = capture.get(cv2.CAP_PROP_FPS)
             capture.release()
         if source_fps is None or source_fps <= 0:
@@ -595,17 +611,17 @@ def inference(args):
         predictor.configure_track_export(args.export_tracks_dir, source_fps)
 
     # human detection on the frame where human FIRST appear
-    if os.path.isfile(args.input_video) and args.input_video.endswith(".mp4"):
+    if os.path.isfile(input_video) and input_video.endswith(".mp4"):
         input_type = "video"
-        image = read_frame_at(args.input_video, 0)
+        image = read_frame_at(input_video, 0)
         width, height = image.size
         for starting_frame_idx in range(10, 100):
-            image = np.array(read_frame_at(args.input_video, starting_frame_idx))
+            image = np.array(read_frame_at(input_video, starting_frame_idx))
             outputs = predictor.sam3_3d_body_model.process_one_image(image, bbox_thr=0.6,)
             if len(outputs) > 0:
                 break
         
-        inference_state = predictor.predictor.init_state(video_path=args.input_video)
+        inference_state = predictor.predictor.init_state(video_path=input_video)
         predictor.predictor.clear_all_points_in_video(inference_state)
         predictor.RUNTIME['inference_state'] = inference_state
         predictor.RUNTIME['out_obj_ids'] = []
@@ -671,6 +687,23 @@ if __name__ == "__main__":
     parser.add_argument("--full_frame", action="store_true", help="Use the full frame as the initial person region instead of ViTDet")
     parser.add_argument("--disable_completion", action="store_true", help="Disable optional Diffusion-VAS completion models")
     parser.add_argument("--tracks_only", action="store_true", help="Save track data without rendering meshes or exporting PLY files")
+    parser.add_argument(
+        "--stabilize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stabilize an MP4 before passing it to SAM3 (default: enabled; use --no-stabilize to disable)",
+    )
+    parser.add_argument("--stabilize-output", type=str, help="Output MP4 path for the stabilized video")
+    parser.add_argument("--stabilize-diagnostics", type=str, help="Output JSON path for stabilization diagnostics")
+    parser.add_argument(
+        "--stabilize-smoothing-sec",
+        type=float,
+        default=0.2,
+        help="Zero-phase camera trajectory smoothing window in seconds (default: 0.2)",
+    )
+    parser.add_argument("--stabilize-min-inliers", type=int, default=40, help="Minimum RANSAC inliers per frame pair")
+    parser.add_argument("--stabilize-min-inlier-ratio", type=float, default=0.5, help="Minimum RANSAC inlier ratio per frame pair")
+    parser.add_argument("--stabilize-failure", choices=("error",), default="error", help="Quality-gate failure policy")
     args = parser.parse_args()
 
     input_path = args.input_video
@@ -696,5 +729,16 @@ if __name__ == "__main__":
         raise ValueError(
             f"--input_video must be an .mp4 file or a directory: {input_path}"
         )
+    if args.stabilize:
+        if not os.path.isfile(input_path) or not input_path.lower().endswith(".mp4"):
+            raise ValueError("--stabilize requires an MP4 --input_video")
+        if not args.stabilize_output:
+            input_root, _ = os.path.splitext(input_path)
+            args.stabilize_output = f"{input_root}.stabilized.mp4"
+        if not args.stabilize_diagnostics:
+            input_root, _ = os.path.splitext(input_path)
+            args.stabilize_diagnostics = f"{input_root}.stabilize.json"
+        if args.stabilize_failure != "error":
+            raise ValueError("only --stabilize-failure error is currently supported")
 
     inference(args)
