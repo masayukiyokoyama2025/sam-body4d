@@ -43,7 +43,7 @@ def _pil_load(path: str, image_format: str) -> Image.Image:
 
 
 def _cv2_load(path: str, image_format: str) -> np.ndarray:
-    img = cv2.imread(path)
+    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is not None and image_format.lower() == "rgb":
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img

@@ -111,10 +111,11 @@ class MHRHead(nn.Module):
                 lod=1,
             )
         else:
-            self.mhr = torch.jit.load(
-                mhr_model_path,
-                map_location=("cuda" if torch.cuda.is_available() else "cpu"),
-            )
+            with open(mhr_model_path, "rb") as mhr_file:
+                self.mhr = torch.jit.load(
+                    mhr_file,
+                    map_location=("cuda" if torch.cuda.is_available() else "cpu"),
+                )
 
         for param in self.mhr.parameters():
             param.requires_grad = False
