@@ -580,6 +580,7 @@ def inference(args):
             smoothing_sec=args.stabilize_smoothing_sec,
             min_inliers=args.stabilize_min_inliers,
             min_inlier_ratio=args.stabilize_min_inlier_ratio,
+            max_reprojection_error=args.stabilize_max_reprojection_error,
         )
         stabilize_video(
             input_path=input_video,
@@ -703,6 +704,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--stabilize-min-inliers", type=int, default=40, help="Minimum RANSAC inliers per frame pair")
     parser.add_argument("--stabilize-min-inlier-ratio", type=float, default=0.5, help="Minimum RANSAC inlier ratio per frame pair")
+    parser.add_argument(
+        "--stabilize-max-reprojection-error",
+        type=float,
+        default=20.0,
+        help="Maximum median RANSAC reprojection error in pixels (default: 20.0)",
+    )
     parser.add_argument("--stabilize-failure", choices=("error",), default="error", help="Quality-gate failure policy")
     args = parser.parse_args()
 

@@ -22,7 +22,7 @@ class StabilizationConfig:
     smoothing_sec: float
     min_inliers: int = 40
     min_inlier_ratio: float = 0.5
-    max_reprojection_error: float = 5.0
+    max_reprojection_error: float = 20.0
     max_features: int = 800
     quality_level: float = 0.01
     min_distance: float = 8.0
